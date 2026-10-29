@@ -1,0 +1,94 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signed() { return request.auth != null && request.auth.token.firebase.sign_in_provider == 'google.com'; }
+    function short(v) { return v is string && v.size() > 0 && v.size() <= 160; }
+    function optionalText(v,n) { return v is string && v.size() <= n; }
+    function date(v) { return v is string && v.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'); }
+    function time(v) { return v is string && v.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$'); }
+    function audit(d) {
+      return d.createdAt is timestamp && d.updatedAt == request.time
+        && short(d.createdByUid) && short(d.createdByName)
+        && d.updatedByUid == request.auth.uid && d.updatedByName == request.auth.token.get('name','Band member')
+        && d.version is int && d.version >= 1;
+    }
+    function createAudit(d) { return audit(d) && d.createdAt == request.time && d.createdByUid == request.auth.uid && d.createdByName == request.auth.token.get('name','Band member') && d.version == 1; }
+    function updateAudit(d) { return audit(d) && d.createdAt == resource.data.createdAt && d.createdByUid == resource.data.createdByUid && d.createdByName == resource.data.createdByName && d.version == resource.data.version + 1; }
+    function venueOpen(id) { return getAfter(/databases/$(database)/documents/venues/$(id)).data.deleting == false; }
+    function gigOpen(id) { return getAfter(/databases/$(database)/documents/gigs/$(id)).data.deleting == false; }
+    function venueShape(d) {
+      return d.keys().hasOnly(['searchTokens','name','contact','phone','approachDate','approachedByUid','approachedByName','response','notes','deleting','createdAt','createdByUid','createdByName','updatedAt','updatedByUid','updatedByName','version'])
+        && d.searchTokens is list && d.searchTokens.size() <= 900 && short(d.name) && short(d.contact) && d.phone is string && d.phone.size() >= 3 && d.phone.size() <= 40
+        && date(d.approachDate) && short(d.approachedByUid) && short(d.approachedByName)
+        && exists(/databases/$(database)/documents/profiles/$(d.approachedByUid))
+        && d.response in ['Awaiting reply','Not right now','Follow-up required','Gig confirmed'] && optionalText(d.notes,4000) && d.deleting is bool;
+    }
+    function gigShape(d) {
+      return d.keys().hasOnly(['name','venueId','venueName','date','time','payoutPaise','status','deleting','createdAt','createdByUid','createdByName','updatedAt','updatedByUid','updatedByName','version'])
+        && short(d.name) && short(d.venueId) && short(d.venueName) && date(d.date) && time(d.time)
+        && d.payoutPaise is int && d.payoutPaise >= 0 && d.payoutPaise <= 100000000000
+        && d.status in ['Upcoming','Completed','Cancelled'] && d.deleting is bool;
+    }
+    function pad(n) { return n < 10 ? '0' + string(n) : string(n); }
+    function todayIST() { let t = request.time + duration.value(330,'m'); return string(t.year()) + '-' + pad(t.month()) + '-' + pad(t.day()); }
+    function paymentEligible(d) { return d.gigStatus != 'Cancelled' && (d.gigStatus == 'Completed' || d.gigDate < todayIST()); }
+    function paymentShape(d,id) {
+      let g = getAfter(/databases/$(database)/documents/gigs/$(d.gigId)).data;
+      return d.keys().hasOnly(['gigId','venueId','gigDate','gigStatus','status','createdAt','createdByUid','createdByName','updatedAt','updatedByUid','updatedByName','version'])
+        && d.gigId == id && d.venueId == g.venueId && d.gigDate == g.date && d.gigStatus == g.status
+        && d.status in ['Payment received','Follow-up required','Payment denied'];
+    }
+    function followShape(d,type) {
+      return d.keys().hasOnly(['type','venueId','venueName','gigId','paymentId','scheduledAt','status','note','previousId','nextId','completedAt','completedByUid','completedByName','createdAt','createdByUid','createdByName','updatedAt','updatedByUid','updatedByName','version'])
+        && d.type == type && short(d.venueId) && short(d.venueName)
+        && optionalText(d.gigId,160) && optionalText(d.paymentId,160)
+        && (type == 'Venue' ? d.gigId == '' && d.paymentId == '' : short(d.gigId) && d.paymentId == d.gigId && getAfter(/databases/$(database)/documents/gigs/$(d.gigId)).data.venueId == d.venueId)
+        && d.scheduledAt is timestamp && d.status in ['Pending','Completed','Rescheduled']
+        && optionalText(d.note,4000) && optionalText(d.previousId,160) && optionalText(d.nextId,160)
+        && (d.status == 'Pending' ? d.completedAt == null && d.completedByUid == '' && d.completedByName == '' && d.nextId == '' : d.completedAt == request.time && d.completedByUid == request.auth.uid && short(d.completedByName))
+        && (d.status == 'Rescheduled' ? short(d.nextId) : d.nextId == '');
+    }
+    function validFollowCreate(d,type) { return createAudit(d) && followShape(d,type) && d.status == 'Pending' && venueOpen(d.venueId) && (type == 'Venue' || gigOpen(d.gigId)); }
+    function validFollowUpdate(d,type,col,id) {
+      return updateAudit(d) && followShape(d,type) && resource.data.status == 'Pending' && d.status in ['Completed','Rescheduled']
+        && d.venueId == resource.data.venueId && d.gigId == resource.data.gigId && d.paymentId == resource.data.paymentId
+        && d.type == resource.data.type && d.scheduledAt == resource.data.scheduledAt && d.previousId == resource.data.previousId
+        && venueOpen(d.venueId) && (type == 'Venue' || gigOpen(d.gigId))
+        && (d.status != 'Rescheduled' || getAfter(/databases/$(database)/documents/$(col)/$(d.nextId)).data.previousId == id);
+    }
+    match /profiles/{uid} {
+      allow read: if signed();
+      function shape(d) { return d.keys().hasOnly(['displayName','email','photoURL','theme','createdAt','lastActiveAt']) && short(d.displayName) && optionalText(d.email,320) && optionalText(d.photoURL,2048) && d.theme in ['light','dark','system'] && d.createdAt is timestamp && d.lastActiveAt is timestamp; }
+      function identity(d) { return d.displayName == request.auth.token.get('name','Band member') && d.email == request.auth.token.get('email','') && d.photoURL == request.auth.token.get('picture',''); }
+      allow create: if signed() && request.auth.uid == uid && shape(request.resource.data) && identity(request.resource.data) && request.resource.data.createdAt == request.time && request.resource.data.lastActiveAt == request.time && request.resource.data.theme == 'system';
+      allow update: if signed() && request.auth.uid == uid && shape(request.resource.data) && request.resource.data.createdAt == resource.data.createdAt && (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['theme']) || (identity(request.resource.data) && request.resource.data.lastActiveAt == request.time));
+      allow delete: if false;
+    }
+    match /venues/{id} {
+      allow read, delete: if signed();
+      allow create: if signed() && venueShape(request.resource.data) && createAudit(request.resource.data) && request.resource.data.deleting == false;
+      allow update: if signed() && venueShape(request.resource.data) && updateAudit(request.resource.data) && (resource.data.deleting == false || request.resource.data.deleting == true);
+    }
+    match /gigs/{id} {
+      allow read, delete: if signed();
+      allow create: if signed() && gigShape(request.resource.data) && createAudit(request.resource.data) && venueOpen(request.resource.data.venueId) && request.resource.data.deleting == false;
+      allow update: if signed() && gigShape(request.resource.data) && updateAudit(request.resource.data) && request.resource.data.venueId == resource.data.venueId && venueOpen(request.resource.data.venueId) && (resource.data.deleting == false || request.resource.data.deleting == true)
+        && (!exists(/databases/$(database)/documents/paymentRecords/$(id)) || (getAfter(/databases/$(database)/documents/paymentRecords/$(id)).data.gigDate == request.resource.data.date && getAfter(/databases/$(database)/documents/paymentRecords/$(id)).data.gigStatus == request.resource.data.status));
+    }
+    match /paymentRecords/{id} {
+      allow read, delete: if signed();
+      allow create: if signed() && createAudit(request.resource.data) && paymentShape(request.resource.data,id) && venueOpen(request.resource.data.venueId) && gigOpen(id) && paymentEligible(request.resource.data);
+      allow update: if signed() && updateAudit(request.resource.data) && paymentShape(request.resource.data,id) && venueOpen(request.resource.data.venueId) && gigOpen(id);
+    }
+    match /venueFollowUps/{id} {
+      allow read, delete: if signed();
+      allow create: if signed() && validFollowCreate(request.resource.data,'Venue');
+      allow update: if signed() && validFollowUpdate(request.resource.data,'Venue','venueFollowUps',id);
+    }
+    match /paymentFollowUps/{id} {
+      allow read, delete: if signed();
+      allow create: if signed() && validFollowCreate(request.resource.data,'Payment');
+      allow update: if signed() && validFollowUpdate(request.resource.data,'Payment','paymentFollowUps',id);
+    }
+  }
+}

@@ -1,0 +1,14 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {todayIST,eligible,upcoming,toPaise,assertVersion,dueState,resolveMember} from '../src/lib/business.ts';
+test('IST changes date at 18:30 UTC',()=>{assert.equal(todayIST(new Date('2026-10-28T18:29:59Z')),'2026-10-28');assert.equal(todayIST(new Date('2026-10-28T18:30:00Z')),'2026-10-29')});
+test('past gig is payment eligible without modifying status',()=>{const g={date:'2026-10-27',status:'Upcoming'};assert.equal(eligible(g,'2026-10-28'),true);assert.equal(g.status,'Upcoming')});
+test('future gig becomes eligible when completed',()=>assert.equal(eligible({date:'2027-01-01',status:'Completed'},'2026-10-28'),true));
+test('today upcoming is not payment eligible',()=>assert.equal(eligible({date:'2026-10-28',status:'Upcoming'},'2026-10-28'),false));
+test('cancelled gigs excluded',()=>{for(const date of ['2020-01-01','2030-01-01']){assert.equal(eligible({date,status:'Cancelled'}),false);assert.equal(upcoming({date,status:'Cancelled'}),false)}});
+test('exact paise parsing',()=>{assert.equal(toPaise('100000.01'),10000001);assert.equal(toPaise('0.1'),10);for(const v of ['1.001','-1','abc','Infinity'])assert.throws(()=>toPaise(v))});
+test('approached by defaults to current member',()=>assert.deepEqual(resolveMember('',[],{uid:'a',displayName:'A'}),{approachedByUid:'a',approachedByName:'A'}));
+test('selected member must be registered',()=>{assert.equal(resolveMember('b',[{id:'b',displayName:'B'}],{uid:'a',displayName:'A'}).approachedByUid,'b');assert.throws(()=>resolveMember('typed-name',[],{uid:'a',displayName:'A'}))});
+test('reminders remain overdue day after day',()=>{const instant=Date.parse('2026-10-01T18:30Z');assert.equal(dueState('Pending',instant,instant),'Due now');assert.equal(dueState('Pending',instant,Date.parse('2026-10-28T18:30Z')),'Overdue');assert.equal(dueState('Completed',instant,instant+1000),'Completed')});
+test('conflict checks reject newer version',()=>{assert.throws(()=>assertVersion(2,1),/changed/);assert.doesNotThrow(()=>assertVersion(2,2))});
+test('search indexes venue, contact and textual phone prefixes',async()=>{const {searchTokens}=await import('../src/lib/business.ts');const tokens=searchTokens(['Blue Note','Jo Smith','+91 00123']);assert.ok(tokens.includes('blue'));assert.ok(tokens.includes('note'));assert.ok(tokens.includes('smith'));assert.ok(tokens.includes('+91 00'));assert.ok(tokens.length<=900)});
